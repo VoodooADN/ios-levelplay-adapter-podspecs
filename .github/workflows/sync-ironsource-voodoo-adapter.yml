@@ -1,0 +1,101 @@
+# Syncs the official IronSourceVoodooAdapter podspec (CocoaPods trunk) into
+# this repo as VoodooISAdapter when a new adapter version appears.
+name: Sync LevelPlay adapter
+
+on:
+  workflow_dispatch:
+    inputs:
+      ironsource_sdk_version:
+        description: "The exact version of 'IronSourceSDK' to use (e.g. 9.3.0.0)"
+        required: false
+        default: "9.3.0.0"
+
+concurrency:
+  group: sync-levelplay-adapter
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler: none
+
+      - name: Install CocoaPods
+        run: |
+          set -euo pipefail
+          if ! command -v pod >/dev/null 2>&1; then
+            gem install cocoapods -N
+          fi
+          pod --version
+
+      - name: Update pod repos and generate podspec
+        id: gen
+        env:
+          COCOAPODS_DISABLE_STATS: "true"
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.ironsource_sdk_version }}" ]; then
+            IRONSOURCE_SDK_VERSION="${{ github.event.inputs.ironsource_sdk_version }}"
+          else
+            IRONSOURCE_SDK_VERSION="9.3.0.0"
+          fi
+          export IRONSOURCE_SDK_VERSION
+          chmod +x scripts/podspec_json_to_ruby.sh scripts/emit_voodoois_podspec.sh
+          pod repo update
+
+          official="$(pod spec which IronSourceVoodooAdapter | tr -d '\r' | tr -d '\n')"
+          if [ ! -f "$official" ]; then
+            echo "error: could not resolve IronSourceVoodooAdapter podspec: $official" >&2
+            exit 1
+          fi
+          echo "Official podspec: $official"
+
+          adapter_version="$(jq -r '.version' "$official")"
+          echo "Adapter version: $adapter_version"
+          target="VoodooISAdapter/${adapter_version}/VoodooISAdapter.podspec"
+
+          if [ -f "$target" ]; then
+            echo "Already have $target — nothing to do."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "skip_commit=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mkdir -p "VoodooISAdapter/${adapter_version}"
+          ./scripts/podspec_json_to_ruby.sh "$official" "$IRONSOURCE_SDK_VERSION" > "$target"
+          echo "Wrote $target"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "skip_commit=false" >> "$GITHUB_OUTPUT"
+          echo "adapter_version=${adapter_version}" >> "$GITHUB_OUTPUT"
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+
+      - name: pod spec lint
+        if: steps.gen.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          pod spec lint "${{ steps.gen.outputs.target }}" --allow-warnings
+
+      - name: Commit and push
+        if: steps.gen.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${{ steps.gen.outputs.target }}"
+          git status
+          if git diff --staged --quiet; then
+            echo "No staged changes (unexpected)."; exit 1
+          fi
+          version="${{ steps.gen.outputs.adapter_version }}"
+          git commit -m "Add VoodooISAdapter ${version} from IronSourceVoodooAdapter"
+          git push
